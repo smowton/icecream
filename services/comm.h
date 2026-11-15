@@ -289,6 +289,8 @@ class Service
 {
 public:
     static MsgChannel *createChannel(const std::string &host, unsigned short p, int timeout);
+    static MsgChannel *createChannel(const std::string &host, unsigned short p, int timeout,
+                                     const std::string &socks_proxy);
     static MsgChannel *createChannel(const std::string &domain_socket);
     static MsgChannel *createChannel(int remote_fd, struct sockaddr *, socklen_t);
 };

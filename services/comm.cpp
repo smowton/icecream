@@ -26,6 +26,7 @@
 
 #include <signal.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -45,6 +46,8 @@
 #include <string>
 #include <iostream>
 #include <assert.h>
+#include <stdlib.h>
+#include <vector>
 #include <lzo/lzo1x.h>
 #include <zstd.h>
 #include <stdio.h>
@@ -843,6 +846,200 @@ MsgChannel *Service::createChannel(const string &hostname, unsigned short p, int
 
     trace() << "connected to " << hostname << endl;
     return createChannel(remote_fd, (struct sockaddr *)&remote_addr, sizeof(remote_addr));
+}
+
+namespace
+{
+
+static bool decode_proxy_component(const string &encoded, string &decoded)
+{
+    for (string::size_type i = 0; i < encoded.size(); ++i) {
+        if (encoded[i] == '%') {
+            if (i + 2 >= encoded.size())
+                return false;
+            char hex[3] = { encoded[i + 1], encoded[i + 2], '\0' };
+            char *end = 0;
+            long value = strtol(hex, &end, 16);
+            if (!end || *end || value == 0)
+                return false;
+            decoded += static_cast<char>(value);
+            i += 2;
+        } else {
+            decoded += encoded[i];
+        }
+    }
+    return true;
+}
+
+static bool parse_socks_proxy(const string &url, vector<string> &arguments)
+{
+    const string socks5 = "socks5://";
+    const string socks5h = "socks5h://";
+    bool remote_dns;
+    string::size_type start;
+
+    if (url.compare(0, socks5h.size(), socks5h) == 0) {
+        remote_dns = true;
+        start = socks5h.size();
+    } else if (url.compare(0, socks5.size(), socks5) == 0) {
+        remote_dns = false;
+        start = socks5.size();
+    } else {
+        return false;
+    }
+
+    string authority = url.substr(start);
+    if (authority.find_first_of("/?#") != string::npos)
+        return false;
+
+    string username;
+    string password;
+    string::size_type at = authority.rfind('@');
+    if (at != string::npos) {
+        string userinfo = authority.substr(0, at);
+        string::size_type colon = userinfo.find(':');
+        if (colon == string::npos ||
+            !decode_proxy_component(userinfo.substr(0, colon), username) ||
+            !decode_proxy_component(userinfo.substr(colon + 1), password) ||
+            username.empty()) {
+            return false;
+        }
+        authority.erase(0, at + 1);
+    }
+
+    string proxy_host;
+    string proxy_port;
+    if (!authority.empty() && authority[0] == '[') {
+        string::size_type close = authority.find(']');
+        if (close == string::npos || close + 1 >= authority.size() || authority[close + 1] != ':')
+            return false;
+        proxy_host = authority.substr(0, close + 1);
+        proxy_port = authority.substr(close + 2);
+    } else {
+        string::size_type colon = authority.rfind(':');
+        if (colon == string::npos || authority.find(':') != colon)
+            return false;
+        proxy_host = authority.substr(0, colon);
+        proxy_port = authority.substr(colon + 1);
+    }
+
+    if (proxy_host.empty() || proxy_port.empty())
+        return false;
+    for (string::const_iterator it = proxy_port.begin(); it != proxy_port.end(); ++it) {
+        if (*it < '0' || *it > '9')
+            return false;
+    }
+    char *end = 0;
+    long port = strtol(proxy_port.c_str(), &end, 10);
+    if (!end || *end || port < 1 || port > 65535)
+        return false;
+
+    arguments.push_back("ncat");
+    arguments.push_back("--proxy-type");
+    arguments.push_back("socks5");
+    if (remote_dns) {
+        arguments.push_back("--proxy-dns");
+        arguments.push_back("remote");
+    }
+    arguments.push_back("--proxy");
+    arguments.push_back(proxy_host + ":" + proxy_port);
+    if (at != string::npos) {
+        arguments.push_back("--proxy-auth");
+        arguments.push_back(username + ":" + password);
+    }
+    return true;
+}
+
+class NcatMsgChannel : public MsgChannel
+{
+public:
+    NcatMsgChannel(int fd, pid_t pid, const string &hostname)
+        : MsgChannel(fd, 0, 0), child_pid(pid)
+    {
+        name = hostname;
+    }
+
+    ~NcatMsgChannel()
+    {
+        if (fd >= 0) {
+            shutdown(fd, SHUT_RDWR);
+            close(fd);
+            fd = -1;
+        }
+        int status;
+        pid_t result;
+        do {
+            result = waitpid(child_pid, &status, WNOHANG);
+        } while (result < 0 && errno == EINTR);
+        if (result == 0) {
+            kill(child_pid, SIGTERM);
+            while (waitpid(child_pid, &status, 0) < 0 && errno == EINTR) {}
+        }
+    }
+
+private:
+    pid_t child_pid;
+};
+
+}
+
+MsgChannel *Service::createChannel(const string &hostname, unsigned short p, int timeout,
+                                   const string &socks_proxy)
+{
+    vector<string> arguments;
+    if (!parse_socks_proxy(socks_proxy, arguments)) {
+        log_error() << "invalid ICECC_SOCKS_PROXY URL" << endl;
+        return 0;
+    }
+
+    if (timeout > 0) {
+        ostringstream timeout_arg;
+        timeout_arg << timeout;
+        arguments.push_back("--wait");
+        arguments.push_back(timeout_arg.str());
+    }
+    arguments.push_back(hostname);
+    ostringstream port_arg;
+    port_arg << p;
+    arguments.push_back(port_arg.str());
+
+    int sockets[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) < 0) {
+        log_perror("socketpair()");
+        return 0;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        log_perror("fork()");
+        close(sockets[0]);
+        close(sockets[1]);
+        return 0;
+    }
+    if (pid == 0) {
+        close(sockets[0]);
+        if (dup2(sockets[1], STDIN_FILENO) < 0 || dup2(sockets[1], STDOUT_FILENO) < 0)
+            _exit(126);
+        if (sockets[1] != STDIN_FILENO && sockets[1] != STDOUT_FILENO)
+            close(sockets[1]);
+
+        vector<char *> argv;
+        for (vector<string>::iterator it = arguments.begin(); it != arguments.end(); ++it)
+            argv.push_back(const_cast<char *>(it->c_str()));
+        argv.push_back(0);
+        execvp(argv[0], &argv[0]);
+        log_perror("exec ncat");
+        _exit(127);
+    }
+
+    close(sockets[1]);
+    NcatMsgChannel *channel = new NcatMsgChannel(sockets[0], pid, hostname);
+    if (!channel->wait_for_protocol()) {
+        delete channel;
+        return 0;
+    }
+    trace() << "connected to " << hostname << " via ncat" << endl;
+    return channel;
 }
 
 MsgChannel *Service::createChannel(const string &socket_path)

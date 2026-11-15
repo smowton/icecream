@@ -445,7 +445,11 @@ static int build_remote_int(CompileJob &job, UseCSMsg *usecs, MsgChannel *local_
     MsgChannel *cserver = nullptr;
 
     try {
-        cserver = Service::createChannel(hostname, port, 10);
+        const char *socks_proxy = getenv("ICECC_SOCKS_PROXY");
+        if (socks_proxy)
+            cserver = Service::createChannel(hostname, port, 10, socks_proxy);
+        else
+            cserver = Service::createChannel(hostname, port, 10);
 
         if (!cserver) {
             log_error() << "no server found behind given hostname " << hostname << ":"

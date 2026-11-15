@@ -271,6 +271,18 @@ it is not possible to upgrade them for some reason, use
 </refsect1>
 
 <refsect1>
+<title>SOCKS proxy</title>
+
+<para>Remote compiler connections can be routed through an Ncat SOCKS5 proxy by
+setting <varname>ICECC_SOCKS_PROXY</varname> to a URL such as
+<literal>socks5h://username:password@proxy.example:1080</literal>. The
+<literal>socks5h</literal> scheme makes Ncat resolve the remote compile host
+through the proxy. Ncat must be installed and available in <envar>PATH</envar>.
+When the variable is unset, Icecream connects directly as usual.</para>
+
+</refsect1>
+
+<refsect1>
 <title>Some Numbers</title>
 
 <para>
